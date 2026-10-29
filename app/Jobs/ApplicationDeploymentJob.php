@@ -445,7 +445,7 @@ class ApplicationDeploymentJob implements ShouldBeEncrypted, ShouldQueue
 
             try {
                 $this->application_deployment_queue->addLogEntry("Gracefully shutting down build container: {$this->deployment_uuid}");
-                $this->graceful_shutdown_container($this->deployment_uuid, skipRemove: true);
+                $this->graceful_shutdown_container($this->deployment_uuid, skipRemove: true, evenIfCancelled: true);
             } catch (Exception $e) {
                 // Log but don't fail - container cleanup errors are expected when container is already gone
                 \Log::warning('Failed to shutdown container '.$this->deployment_uuid.': '.$e->getMessage());
@@ -508,7 +508,9 @@ class ApplicationDeploymentJob implements ShouldBeEncrypted, ShouldQueue
         }
 
         $this->build_server = $buildServers->random();
-        $this->application_deployment_queue->build_server_id = $this->build_server->id;
+        // Saved right away: every remote command refreshes the queue row, which would drop an unsaved value,
+        // and cancelling a deployment looks for its helper container on this server.
+        $this->application_deployment_queue->update(['build_server_id' => $this->build_server->id]);
         $this->application_deployment_queue->addLogEntry("Found a suitable build server ({$this->build_server->name}).");
         $this->use_build_server = true;
     }
@@ -5238,27 +5240,27 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         $this->application_deployment_queue->addLogEntry('Building docker image completed.');
     }
 
-    private function graceful_shutdown_container(string $containerName, bool $skipRemove = false)
+    /**
+     * With $evenIfCancelled, the commands also run after the deployment was cancelled,
+     * so the helper container of a cancelled deployment is still stopped.
+     */
+    private function graceful_shutdown_container(string $containerName, bool $skipRemove = false, bool $evenIfCancelled = false)
     {
         try {
             $timeout = $this->application->settings->deploymentStopGracePeriodSeconds();
 
-            if ($skipRemove) {
-                $this->execute_remote_command(
-                    [dockerStopCommand($timeout, escapeshellarg($containerName), $this->server), 'hidden' => true, 'ignore_errors' => true]
-                );
-            } else {
-                $this->execute_remote_command(
-                    [dockerStopCommand($timeout, escapeshellarg($containerName), $this->server), 'hidden' => true, 'ignore_errors' => true]
-                );
-                $this->removeContainerWithTimeout($containerName);
+            $this->execute_remote_command(
+                [dockerStopCommand($timeout, escapeshellarg($containerName), $this->server), 'hidden' => true, 'ignore_errors' => true, 'skip_cancellation_check' => $evenIfCancelled]
+            );
+            if (! $skipRemove) {
+                $this->removeContainerWithTimeout($containerName, $evenIfCancelled);
             }
         } catch (Exception $error) {
             $this->application_deployment_queue->addLogEntry("Error stopping container $containerName: ".$error->getMessage(), 'stderr');
         }
     }
 
-    private function removeContainerWithTimeout(string $containerName): void
+    private function removeContainerWithTimeout(string $containerName, bool $evenIfCancelled = false): void
     {
         $outputKey = 'container_remove_'.md5($containerName);
 
@@ -5268,6 +5270,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
             'ignore_errors' => true,
             'save' => $outputKey,
             'append' => false,
+            'skip_cancellation_check' => $evenIfCancelled,
         ]);
 
         if (! isset($this->saved_outputs)) {
